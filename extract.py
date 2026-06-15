@@ -52,7 +52,7 @@ logger = logging.getLogger(__name__)
 
 
 # *********************************************************************************************************************************************
-# 3 - Main request with safeguards
+# 3 - API call with safeguards
 # *********************************************************************************************************************************************
 def fetch_page(cuisine=None, meal_type=None, diet=None, offset=0):
     params = {
@@ -63,9 +63,9 @@ def fetch_page(cuisine=None, meal_type=None, diet=None, offset=0):
         "addRecipeNutrition": True,
         "addRecipeInstructions": True,
     }
-    if cuisine:    params["cuisine"] = cuisine
-    if meal_type:  params["type"] = meal_type
-    if diet:       params["diet"] = diet
+    if cuisine: params["cuisine"] = cuisine
+    if meal_type: params["type"] = meal_type
+    if diet: params["diet"] = diet
 
     for attempt in range(1, MAX_RETRIES + 1):
         try:
