@@ -1,0 +1,21 @@
+# Cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Virtual environment 
+data_venv/
+
+# Secrets
+.env
+
+# Data & tests
+*.parquet
+/tmp/
+test_connection.py
+
+# Notebooks
+.ipynb_checkpoints/
+*.ipynb
