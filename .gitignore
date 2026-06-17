@@ -11,9 +11,10 @@ data_venv/
 # Secrets
 .env
 
-# Data
+# Data & tests
 *.parquet
 /tmp/
+test_connection.py
 
 # Notebooks
 .ipynb_checkpoints/
