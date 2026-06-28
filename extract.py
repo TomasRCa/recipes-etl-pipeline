@@ -1,5 +1,6 @@
 import requests
 import time
+import json
 import logging
 from datetime import datetime, timezone
 from dotenv import load_dotenv
@@ -20,11 +21,16 @@ DB_NAME     = os.getenv("POSTGRES_DB")
 DB_USER     = os.getenv("POSTGRES_USER")
 DB_PASSWORD = os.getenv("POSTGRES_PASSWORD")
 
+
 BRONZE_SCHEMA = "bronze"
 BRONZE_TABLE = "recipes"
 
 LOG_SCHEMA = "logging"
 LOG_TABLE = "extraction_log"
+
+CONTROL_SCHEMA = "control"
+BATCH_TABLE = "pipeline_batches"
+
 
 if not API_KEY:
     raise EnvironmentError("API_KEY not found")
@@ -74,30 +80,91 @@ ENGINE = get_engine()
 
 
 # *********************************************************************************************************************************************
-# 3 - Create Logging Schema and tables. Displayed on the console and saved on PostgreSQL Database
+# 3 - Control schema: owns batch identity. Both bronze.recipes and logging.extraction_log carry a
+#     batch_id that's a foreign key into this table.
 # *********************************************************************************************************************************************
-def create_log_table(engine) -> None:
-    sql = f"""
-        CREATE SCHEMA IF NOT EXISTS {LOG_SCHEMA};
 
-        CREATE TABLE IF NOT EXISTS {LOG_SCHEMA}.{LOG_TABLE} (
-            id          SERIAL PRIMARY KEY,
-            log_time    TIMESTAMPTZ,
-            level       TEXT,
-            logger_name TEXT,
-            message     TEXT
+def create_control_table(engine) -> None:
+    sql = f"""
+        CREATE SCHEMA IF NOT EXISTS {CONTROL_SCHEMA};
+
+        CREATE TABLE IF NOT EXISTS {CONTROL_SCHEMA}.{BATCH_TABLE} (
+            batch_id     SERIAL PRIMARY KEY,
+            started_at   TIMESTAMPTZ NOT NULL,
+            finished_at  TIMESTAMPTZ,
+            status       TEXT NOT NULL DEFAULT 'running',
+            rows_written INTEGER
         );
     """
     with engine.begin() as conn:
         conn.execute(text(sql))
 
 
-# Writes each log record as a row in logging.extraction_log. Failures here are swallowed (via handleError) so a DB hiccup never crashes the extraction run itself
+def start_batch(engine) -> int:
+    with engine.begin() as conn:
+        result = conn.execute(
+            text(f"""
+                INSERT INTO {CONTROL_SCHEMA}.{BATCH_TABLE} (started_at, status)
+                VALUES (:started_at, 'running')
+                RETURNING batch_id
+            """),
+            {"started_at": datetime.now(timezone.utc)},
+        )
+        return result.scalar()
+
+
+def finish_batch(engine, batch_id: int, status: str, rows_written: int) -> None:
+    with engine.begin() as conn:
+        conn.execute(
+            text(f"""
+                UPDATE {CONTROL_SCHEMA}.{BATCH_TABLE}
+                SET finished_at = :finished_at, status = :status, rows_written = :rows_written
+                WHERE batch_id = :batch_id
+            """),
+            {
+                "finished_at":   datetime.now(timezone.utc),
+                "status":        status,
+                "rows_written":  rows_written,
+                "batch_id":      batch_id,
+            },
+        )
+
+
+create_control_table(ENGINE)
+BATCH_ID = start_batch(ENGINE)
+
+
+# *********************************************************************************************************************************************
+# 4 - Create Logging Schema and table, tagged with this run's batch_id (FK into control.pipeline_batches).
+#     Displayed on the console and saved on the PostgreSQL Database
+# *********************************************************************************************************************************************
+def create_log_table(engine) -> None:
+    sql = f"""
+        CREATE SCHEMA IF NOT EXISTS {LOG_SCHEMA};
+
+        CREATE TABLE IF NOT EXISTS {LOG_SCHEMA}.{LOG_TABLE} (
+            batch_id    INTEGER REFERENCES {CONTROL_SCHEMA}.{BATCH_TABLE}(batch_id),
+            log_time    TIMESTAMPTZ,
+            level       TEXT,
+            logger_name TEXT,
+            message     TEXT
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_{LOG_TABLE}_batch_id
+            ON {LOG_SCHEMA}.{LOG_TABLE} (batch_id);
+    """
+    with engine.begin() as conn:
+        conn.execute(text(sql))
+
+
+# Writes each log record as a row in logging.extraction_log, tagged with the run's batch_id.
+# Failures here are swallowed (via handleError) so a DB hiccup never crashes the extraction run itself
 class PostgresLogHandler(logging.Handler):
 
-    def __init__(self, engine):
+    def __init__(self, engine, batch_id):
         super().__init__()
         self.engine = engine
+        self.batch_id = batch_id
 
     def emit(self, record):
         try:
@@ -105,11 +172,12 @@ class PostgresLogHandler(logging.Handler):
                 conn.execute(
                     text(f"""
                         INSERT INTO {LOG_SCHEMA}.{LOG_TABLE}
-                            (log_time, level, logger_name, message)
+                            (batch_id, log_time, level, logger_name, message)
                         VALUES
-                            (:log_time, :level, :logger_name, :message)
+                            (:batch_id, :log_time, :level, :logger_name, :message)
                     """),
                     {
+                        "batch_id":    self.batch_id,
                         "log_time":    datetime.now(timezone.utc),
                         "level":       record.levelname,
                         "logger_name": record.name,
@@ -127,14 +195,16 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s"
 )
 
-_pg_handler = PostgresLogHandler(ENGINE)
+_pg_handler = PostgresLogHandler(ENGINE, BATCH_ID)
 _pg_handler.setFormatter(logging.Formatter("%(message)s"))
 logging.getLogger().addHandler(_pg_handler)  # attach to root -> captures all module loggers
 
 logger = logging.getLogger(__name__)
+logger.info(f"Starting batch_id={BATCH_ID}")
+
 
 # *********************************************************************************************************************************************
-# 4 - Create bronze schema and table if they don't exist 
+# 5 - Create bronze schema and table if they don't exist. batch_id is a real FK into control.pipeline_batches
 # *********************************************************************************************************************************************
 def create_bronze_table(engine) -> None:
     sql = f"""
@@ -153,7 +223,9 @@ def create_bronze_table(engine) -> None:
             sugar_g              NUMERIC,
             sodium_mg            NUMERIC,
             iron_mg              NUMERIC,
+            instructions_raw     JSONB,
             cuisine_filter       TEXT,
+            batch_id             INTEGER NOT NULL REFERENCES {CONTROL_SCHEMA}.{BATCH_TABLE}(batch_id),
             extracted_at         TIMESTAMPTZ,
             loaded_at            TIMESTAMPTZ
         );
@@ -161,11 +233,14 @@ def create_bronze_table(engine) -> None:
     with engine.begin() as conn:
         conn.execute(text(sql))
 
-    logger.info(f"Bronze table ready -> {BRONZE_SCHEMA}.{BRONZE_TABLE}")
+
+create_bronze_table(ENGINE)
+
+logger.info(f"Bronze table ready -> {BRONZE_SCHEMA}.{BRONZE_TABLE}")
 
 
 # *********************************************************************************************************************************************
-# 5 - Gets recipe IDs already stored in the bronze layer, avoiding duplicated ingestions, and batch number logic
+# 6 - Gets recipe IDs already stored in the bronze layer, avoiding duplicated ingestions
 # *********************************************************************************************************************************************
 def get_existing_bronze_ids(engine) -> set:
     with engine.connect() as conn:
@@ -173,10 +248,10 @@ def get_existing_bronze_ids(engine) -> set:
             text(f"SELECT recipe_id FROM {BRONZE_SCHEMA}.{BRONZE_TABLE}")
         )
         return set(row[0] for row in result)
-    
+
 
 # *********************************************************************************************************************************************
-# 6 - Pull only the target columns out of a raw recipe object returned by the API
+# 7 - Pull only the target columns out of a raw recipe object returned by the API
 # *********************************************************************************************************************************************
 def get_nutrient(recipe: dict, name: str):
     nutrients = recipe.get("nutrition", {}).get("nutrients", [])
@@ -205,6 +280,7 @@ def extract_recipe_row(recipe: dict, cuisine_filter, extracted_at: datetime, bat
         "sugar_g":             get_nutrient(recipe, "Sugar"),
         "sodium_mg":           get_nutrient(recipe, "Sodium"),
         "iron_mg":             get_nutrient(recipe, "Iron"),
+        "instructions_raw":    json.dumps(recipe.get("analyzedInstructions") or []),
         "cuisine_filter":      cuisine_filter,
         "batch_id":            batch_id,
         "extracted_at":        extracted_at,
@@ -213,7 +289,7 @@ def extract_recipe_row(recipe: dict, cuisine_filter, extracted_at: datetime, bat
 
 
 # *********************************************************************************************************************************************
-# 7 - Write a batch of extracted rows into the bronze layer. Returns the number of rows inserted (duplicates skipped)
+# 8 - Write a batch of extracted rows into the bronze layer. Returns the number of rows inserted (duplicates skipped)
 # *********************************************************************************************************************************************
 def write_bronze(rows: list, engine) -> int:
     if not rows:
@@ -223,12 +299,12 @@ def write_bronze(rows: list, engine) -> int:
         INSERT INTO {BRONZE_SCHEMA}.{BRONZE_TABLE}
             (recipe_id, title, cuisines, diets,
              calories_kcal, protein_g, fat_g, carbs_g, fiber_g, sugar_g, sodium_mg, iron_mg,
-             cuisine_filter, extracted_at, loaded_at)
+             instructions_raw, cuisine_filter, batch_id, extracted_at, loaded_at)
         VALUES(
             :recipe_id, :title, :cuisines, :diets,
             :calories_kcal, :protein_g, :fat_g, :carbs_g,
             :fiber_g, :sugar_g, :sodium_mg, :iron_mg,
-            :cuisine_filter,
+            :instructions_raw, :cuisine_filter, :batch_id,
             :extracted_at, :loaded_at
         )
         ON CONFLICT (recipe_id) DO NOTHING
@@ -242,7 +318,7 @@ def write_bronze(rows: list, engine) -> int:
 
 
 # *********************************************************************************************************************************************
-# 8 - API call with safeguards
+# 9 - API call with safeguards
 # *********************************************************************************************************************************************
 def fetch_page(cuisine=None, diet=None, offset=0):
     params = {
@@ -250,7 +326,8 @@ def fetch_page(cuisine=None, diet=None, offset=0):
         "number": 100,
         "offset": offset,
         "addRecipeInformation": True,
-        "addRecipeNutrition": True
+        "addRecipeNutrition": True,
+        "addRecipeInstructions": True
     }
     if cuisine: params["cuisine"] = cuisine
     if diet: params["diet"] = diet
@@ -292,9 +369,9 @@ def fetch_page(cuisine=None, diet=None, offset=0):
 
 
 # *********************************************************************************************************************************************
-# 9 - Pull all pages for a given filter, extract the target columns, and write them to the bronze layer as they arrive
+# 10 - Pull all pages for a given filter, extract the target columns, and write them to the bronze layer as they arrive
 # *********************************************************************************************************************************************
-def pull_axis(seen_ids, engine, cuisine=None, diet=None) -> int:
+def pull_axis(seen_ids, engine, batch_id, cuisine=None, diet=None) -> int:
 
     label         = cuisine or diet or "no-filter"
     total_written = 0
@@ -317,7 +394,7 @@ def pull_axis(seen_ids, engine, cuisine=None, diet=None) -> int:
             if recipe["id"] not in seen_ids:
                 seen_ids.add(recipe["id"])
                 new_rows.append(
-                    extract_recipe_row(recipe, cuisine, extracted_at)
+                    extract_recipe_row(recipe, cuisine, extracted_at, batch_id)
                 )
 
         written = write_bronze(new_rows, engine)
@@ -338,11 +415,9 @@ def pull_axis(seen_ids, engine, cuisine=None, diet=None) -> int:
 
 
 # *********************************************************************************************************************************************
-# 10 - Main extraction. Extracts recipes across cuisine and diet
+# 11 - Main extraction. Extracts recipes across cuisine and diet
 # *********************************************************************************************************************************************
 def extract(cuisines=CUISINES, diets=None) -> None:
-
-    create_bronze_table(ENGINE)
 
     # Seed seen_ids from existing Bronze records to avoid re-inserting on reruns
     seen_ids = get_existing_bronze_ids(ENGINE)
@@ -350,23 +425,30 @@ def extract(cuisines=CUISINES, diets=None) -> None:
 
     total_written = 0
 
-    # Pull by cuisine
-    if cuisines:
-        for cuisine in cuisines:
-            logger.info(f"Extracting cuisine: {cuisine}")
-            written = pull_axis(seen_ids, ENGINE, cuisine=cuisine)
-            total_written += written
-            logger.info(f"Total written so far: {total_written}")
+    try:
+        # Pull by cuisine
+        if cuisines:
+            for cuisine in cuisines:
+                logger.info(f"Extracting cuisine: {cuisine} | batch_id={BATCH_ID}")
+                written = pull_axis(seen_ids, ENGINE, BATCH_ID, cuisine=cuisine)
+                total_written += written
+                logger.info(f"Total written so far: {total_written}")
 
-    # Pull by diet
-    if diets:
-        for diet in diets:
-            logger.info(f"Extracting diet: {diet}")
-            written = pull_axis(seen_ids, ENGINE, diet=diet)
-            total_written += written
-            logger.info(f"Total written so far: {total_written}")
+        # Pull by diet
+        if diets:
+            for diet in diets:
+                logger.info(f"Extracting diet: {diet} | batch_id={BATCH_ID}")
+                written = pull_axis(seen_ids, ENGINE, BATCH_ID, diet=diet)
+                total_written += written
+                logger.info(f"Total written so far: {total_written}")
 
-    logger.info(f"Extraction complete: {total_written} new recipes written to Bronze")
+        logger.info(f"Extraction complete: {total_written} new recipes written to Bronze")
+        finish_batch(ENGINE, BATCH_ID, status="success", rows_written=total_written)
+
+    except Exception:
+        logger.exception(f"Extraction failed for batch_id={BATCH_ID}")
+        finish_batch(ENGINE, BATCH_ID, status="failed", rows_written=total_written)
+        raise
 
 
 # Standalone testing
