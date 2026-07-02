@@ -57,7 +57,7 @@ DIETS = [
 
 REQUEST_DELAY = 0.5   # Seconds between requests
 MAX_RETRIES = 3        # Retries on failure
-SESSION = requests.Session() 
+SESSION = requests.Session()
 
 
 # *********************************************************************************************************************************************
@@ -75,14 +75,18 @@ ENGINE = get_engine()
 
 
 # *********************************************************************************************************************************************
-# 3 - Control schema: owns batch identity. Both bronze.recipes and logging.extraction_log carry a
-#     batch_id that's a real foreign key into this table, not just a matching integer by convention.
+# 3 - Control schema: owns batch identity and axis-completion tracking.
+#     - pipeline_batches: one row per run (status, timing, rows written)
+#     - completed_axes:   one row per fully-paginated (cuisine, diet) axis. Future runs skip them entirely and never waste quota re-fetching.
 # *********************************************************************************************************************************************
 CONTROL_SCHEMA = "control"
 BATCH_TABLE = "pipeline_batches"
+AXES_TABLE = "completed_axes"
+
+NO_FILTER = "__none__"
 
 
-def create_control_table(engine) -> None:
+def create_control_tables(engine) -> None:
     sql = f"""
         CREATE SCHEMA IF NOT EXISTS {CONTROL_SCHEMA};
 
@@ -92,6 +96,14 @@ def create_control_table(engine) -> None:
             finished_at  TIMESTAMPTZ,
             status       TEXT NOT NULL DEFAULT 'running',
             rows_written INTEGER
+        );
+
+        CREATE TABLE IF NOT EXISTS {CONTROL_SCHEMA}.{AXES_TABLE} (
+            cuisine      TEXT NOT NULL,
+            diet         TEXT NOT NULL,
+            completed_at TIMESTAMPTZ NOT NULL,
+            rows_written INTEGER,
+            PRIMARY KEY (cuisine, diet)
         );
     """
     with engine.begin() as conn:
@@ -128,7 +140,34 @@ def finish_batch(engine, batch_id: int, status: str, rows_written: int) -> None:
         )
 
 
-create_control_table(ENGINE)
+# Returns a set of (cuisine, diet) tuples already fully paginated in prior runs. Values use the NO_FILTER sentinel for the absent dimension
+def get_completed_axes(engine) -> set:
+    with engine.connect() as conn:
+        result = conn.execute(
+            text(f"SELECT cuisine, diet FROM {CONTROL_SCHEMA}.{AXES_TABLE}")
+        )
+        return set((row[0], row[1]) for row in result)
+
+
+# Records a (cuisine, diet) axis as fully paginated. Safe to re-run (ON CONFLICT).
+def mark_axis_complete(engine, cuisine, diet, rows_written: int) -> None:
+    with engine.begin() as conn:
+        conn.execute(
+            text(f"""
+                INSERT INTO {CONTROL_SCHEMA}.{AXES_TABLE} (cuisine, diet, completed_at, rows_written)
+                VALUES (:cuisine, :diet, :completed_at, :rows_written)
+                ON CONFLICT (cuisine, diet) DO NOTHING
+            """),
+            {
+                "cuisine":      cuisine or NO_FILTER,
+                "diet":         diet or NO_FILTER,
+                "completed_at": datetime.now(timezone.utc),
+                "rows_written": rows_written,
+            },
+        )
+
+
+create_control_tables(ENGINE)
 BATCH_ID = start_batch(ENGINE)
 
 
@@ -317,7 +356,8 @@ def write_bronze(rows: list, engine) -> int:
 
 
 # *********************************************************************************************************************************************
-# 9 - API call with safeguards
+# 9 - API call with safeguards. Returns (data, quota_hit) so the caller can tell a
+#     end-of-results (data with no results) apart from a quota/error stop (quota_hit=True)
 # *********************************************************************************************************************************************
 def fetch_page(cuisine=None, diet=None, offset=0):
     params = {
@@ -338,7 +378,7 @@ def fetch_page(cuisine=None, diet=None, offset=0):
 
             if response.status_code == 402:
                 logger.warning("Daily quota exceeded.")
-                return None
+                return None, True   # quota_hit = True
 
             if response.status_code == 429:
                 logger.warning(f"Rate limit exceeded. Attempt {attempt}/{MAX_RETRIES}")
@@ -351,9 +391,9 @@ def fetch_page(cuisine=None, diet=None, offset=0):
 
             if "code" in data and data["code"] != 200:
                 logger.warning(f"API error in response: {data.get('message')}")
-                return None
+                return None, True   # treat API error as a non-completion stop
 
-            return data
+            return data, False
 
         except requests.exceptions.Timeout:
             logger.warning(f"Timeout on attempt {attempt}/{MAX_RETRIES}")
@@ -365,27 +405,31 @@ def fetch_page(cuisine=None, diet=None, offset=0):
             time.sleep(2 ** attempt)
 
     logger.error(f"All {MAX_RETRIES} attempts failed for offset={offset}")
-    return None
+    return None, True   # exhausted retries — treat as non-completion stop
 
 
 # *********************************************************************************************************************************************
-# 10 - Pull all pages for a given filter, extract the target columns, and write them to the bronze layer as they arrive
+# 10 - Pull all pages for a given filter. Returns (rows_written, completed) where completed=True
+#      means the axis was fully paginated to the end (so it can be marked done and skipped next run)
 # *********************************************************************************************************************************************
-def pull_axis(seen_ids, engine, batch_id, cuisine=None, diet=None) -> int:
-
+def pull_axis(seen_ids, engine, batch_id, cuisine=None, diet=None):
     label         = cuisine or diet or "no-filter"
+    if cuisine and diet:
+        label = f"{cuisine}+{diet}"
     total_written = 0
 
     for offset in range(0, 1000, 100):
-        data = fetch_page(cuisine=cuisine, diet=diet, offset=offset)
+        data, quota_hit = fetch_page(cuisine=cuisine, diet=diet, offset=offset)
 
-        if data is None:  # Quota hit or unrecoverable error
-            logger.warning(f"Stopping pagination for '{label}' at offset {offset}")
-            break
+        if quota_hit:
+            # Stopped early due to quota/error — axis is NOT complete, don't mark it.
+            logger.warning(f"Stopping pagination for '{label}' at offset {offset} (quota/error)")
+            return total_written, False
 
         results = data.get("results", [])
 
         if not results:
+            # End of results at this offset. Axis is fully covered.
             break
 
         extracted_at = datetime.now(timezone.utc)
@@ -408,42 +452,67 @@ def pull_axis(seen_ids, engine, batch_id, cuisine=None, diet=None) -> int:
 
         time.sleep(REQUEST_DELAY)
 
-        if len(results) < 100:  # last page
+        if len(results) < 100:  # Last page. End of results
             break
 
-    return total_written
+    # Reached here only by a normal break (end of results), so the axis is complete.
+    return total_written, True
 
 
 # *********************************************************************************************************************************************
-# 11 - Main extraction. Extracts recipes across cuisine and diet
+# 11 - Main extraction. Runs cuisine, diet, and cuisine × diet axes, skipping any already
+#      completed in prior runs
 # *********************************************************************************************************************************************
-def extract(cuisines=CUISINES, diets=None) -> None:
+def extract(cuisines=CUISINES, diets=DIETS) -> None:
 
     # Seed seen_ids from existing Bronze records to avoid re-inserting on reruns
     seen_ids = get_existing_bronze_ids(ENGINE)
+    completed_axes = get_completed_axes(ENGINE)
+
     logger.info(f"Resuming from {len(seen_ids)} already stored recipes")
+    logger.info(f"{len(completed_axes)} axes already completed in prior runs (will be skipped)")
+
+    # Build the full ordered list of (cuisine, diet) axes to process:
+    #   cuisine-only, then diet-only, then every cuisine × diet combination.
+    axes = []
+    if cuisines:
+        axes.extend((c, None) for c in cuisines)
+    if diets:
+        axes.extend((None, d) for d in diets)
+    if cuisines and diets:
+        axes.extend((c, d) for c in cuisines for d in diets)
 
     total_written = 0
+    quota_stopped = False
 
     try:
-        # Pull by cuisine
-        if cuisines:
-            for cuisine in cuisines:
-                logger.info(f"Extracting cuisine: {cuisine} | batch_id={BATCH_ID}")
-                written = pull_axis(seen_ids, ENGINE, BATCH_ID, cuisine=cuisine)
-                total_written += written
-                logger.info(f"Total written so far: {total_written}")
+        for cuisine, diet in axes:
+            axis_key = (cuisine or NO_FILTER, diet or NO_FILTER)
 
-        # Pull by diet
-        if diets:
-            for diet in diets:
-                logger.info(f"Extracting diet: {diet} | batch_id={BATCH_ID}")
-                written = pull_axis(seen_ids, ENGINE, BATCH_ID, diet=diet)
-                total_written += written
-                logger.info(f"Total written so far: {total_written}")
+            if axis_key in completed_axes:
+                continue  # already fully pulled in a prior run —> skip
 
-        logger.info(f"Extraction complete: {total_written} new recipes written to Bronze")
-        finish_batch(ENGINE, BATCH_ID, status="success", rows_written=total_written)
+            label = cuisine or diet or "no-filter"
+            if cuisine and diet:
+                label = f"{cuisine}+{diet}"
+            logger.info(f"Extracting axis: {label} | batch_id={BATCH_ID}")
+
+            written, completed = pull_axis(seen_ids, ENGINE, BATCH_ID, cuisine=cuisine, diet=diet)
+            total_written += written
+
+            if completed:
+                mark_axis_complete(ENGINE, cuisine, diet, written)
+                completed_axes.add(axis_key)
+                logger.info(f"Axis complete: {label} | axis_rows={written} | total={total_written}")
+            else:
+                # Quota hit mid-axis — stop the whole run; resume this axis next time.
+                quota_stopped = True
+                logger.warning(f"Quota reached during axis '{label}'. Stopping run; will resume here next time.")
+                break
+
+        status = "quota_stopped" if quota_stopped else "success"
+        logger.info(f"Extraction {status}: {total_written} new recipes written to Bronze")
+        finish_batch(ENGINE, BATCH_ID, status=status, rows_written=total_written)
 
     except Exception:
         logger.exception(f"Extraction failed for batch_id={BATCH_ID}")
@@ -451,7 +520,7 @@ def extract(cuisines=CUISINES, diets=None) -> None:
         raise
 
 
-# Standalone testing
+# Standalone
 if __name__ == "__main__":
     try:
         extract(
